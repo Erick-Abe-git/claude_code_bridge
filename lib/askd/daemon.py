@@ -216,6 +216,7 @@ class UnifiedAskDaemon:
             "provider": provider,
             "meta": {
                 "session_key": result.session_key,
+                "status": result.status,
                 "done_seen": result.done_seen,
                 "done_ms": result.done_ms,
                 "anchor_seen": result.anchor_seen,

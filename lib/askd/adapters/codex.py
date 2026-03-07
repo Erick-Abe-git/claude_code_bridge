@@ -15,7 +15,14 @@ from askd_runtime import log_path, write_log
 from ccb_protocol import REQ_ID_PREFIX, is_done_text, strip_done_text, extract_reply_for_req, wrap_codex_prompt
 from caskd_session import CodexProjectSession, compute_session_key, load_project_session
 from codex_comm import CodexLogReader
-from completion_hook import notify_completion
+from completion_hook import (
+    COMPLETION_STATUS_CANCELLED,
+    COMPLETION_STATUS_COMPLETED,
+    COMPLETION_STATUS_FAILED,
+    COMPLETION_STATUS_INCOMPLETE,
+    default_reply_for_status,
+    notify_completion,
+)
 from providers import CASKD_SPEC
 from terminal import get_backend_for_session, is_windows
 
@@ -76,6 +83,7 @@ class CodexAdapter(BaseProviderAdapter):
                 req_id=task.req_id,
                 session_key=session_key,
                 done_seen=False,
+                status=COMPLETION_STATUS_FAILED,
             )
 
         ok, pane_or_err = session.ensure_pane()
@@ -86,6 +94,7 @@ class CodexAdapter(BaseProviderAdapter):
                 req_id=task.req_id,
                 session_key=session_key,
                 done_seen=False,
+                status=COMPLETION_STATUS_FAILED,
             )
         pane_id = pane_or_err
 
@@ -97,6 +106,7 @@ class CodexAdapter(BaseProviderAdapter):
                 req_id=task.req_id,
                 session_key=session_key,
                 done_seen=False,
+                status=COMPLETION_STATUS_FAILED,
             )
 
         prompt = wrap_codex_prompt(req.message, task.req_id)
@@ -123,10 +133,7 @@ class CodexAdapter(BaseProviderAdapter):
         _last_reply_snapshot = ""
         _last_reply_changed_at = time.time()
 
-        anchor_grace_deadline = min(deadline, time.time() + 1.5) if deadline else (time.time() + 1.5)
         anchor_collect_grace = min(deadline, time.time() + 2.0) if deadline else (time.time() + 2.0)
-        rebounded = False
-        tail_bytes = int(os.environ.get("CCB_CASKD_REBIND_TAIL_BYTES", str(2 * 1024 * 1024)))
         last_pane_check = time.time()
         default_interval = "5.0" if is_windows() else "2.0"
         pane_check_interval = float(os.environ.get("CCB_CASKD_PANE_CHECK_INTERVAL", default_interval))
@@ -169,30 +176,11 @@ class CodexAdapter(BaseProviderAdapter):
                         fallback_scan=fallback_scan,
                         anchor_ms=anchor_ms,
                         log_path=codex_log_path,
+                        status=COMPLETION_STATUS_FAILED,
                     )
                 last_pane_check = time.time()
 
             event, state = reader.wait_for_event(state, wait_step)
-
-            # Active session detection: check if reader switched to a newer session
-            current_log = reader.current_log_path()
-            if current_log and current_log != state.get("log_path"):
-                _write_log(f"[INFO] Active session switch detected: {current_log}, req_id={task.req_id}")
-                # Update state to follow new session
-                state = _tail_state_for_log(current_log, tail_bytes=tail_bytes)
-                fallback_scan = True
-                # Don't set rebounded=True to allow further rebinds if needed
-
-            # Force rebind at grace deadline even if we have stale events
-            if (not rebounded) and (not anchor_seen) and time.time() >= anchor_grace_deadline and codex_session_id:
-                _write_log(f"[WARN] Anchor not seen by grace deadline, forcing rebind: req_id={task.req_id}")
-                codex_session_id = None
-                reader = CodexLogReader(log_path=preferred_log, session_id_filter=None, work_dir=Path(session.work_dir))
-                log_hint = reader.current_log_path()
-                state = _tail_state_for_log(log_hint, tail_bytes=tail_bytes)
-                fallback_scan = True
-                rebounded = True
-                continue
 
             if event is None:
                 continue
@@ -235,24 +223,9 @@ class CodexAdapter(BaseProviderAdapter):
 
         combined = "\n".join(chunks)
         reply = extract_reply_for_req(combined, task.req_id)
-
-        # Fallback: if timeout but we have a reply with any CCB_DONE marker,
-        # accept it even if req_id doesn't match (degraded completion detection)
-        degraded_completion = False
-        if not done_seen and combined and "CCB_DONE:" in combined:
-            _write_log(f"[WARN] Found CCB_DONE but req_id mismatch for req_id={task.req_id}")
-            # Extract the mismatched req_id for logging
-            for line in combined.splitlines():
-                if "CCB_DONE:" in line:
-                    _write_log(f"[WARN] Expected: CCB_DONE: {task.req_id}, Found: {line.strip()}")
-                    break
-            # Only accept if we have non-empty reply
-            if reply.strip():
-                done_seen = True
-                degraded_completion = True
-                done_ms = _now_ms() - started_ms
-            else:
-                _write_log(f"[WARN] Degraded completion rejected: empty reply for req_id={task.req_id}")
+        status = COMPLETION_STATUS_COMPLETED if done_seen else COMPLETION_STATUS_INCOMPLETE
+        if task.cancelled:
+            status = COMPLETION_STATUS_CANCELLED
 
         codex_log_path = None
         try:
@@ -273,6 +246,7 @@ class CodexAdapter(BaseProviderAdapter):
             anchor_ms=anchor_ms,
             fallback_scan=fallback_scan,
             log_path=codex_log_path,
+            status=status,
         )
         _write_log(
             f"[INFO] done provider=codex req_id={task.req_id} exit={result.exit_code} "
@@ -280,19 +254,16 @@ class CodexAdapter(BaseProviderAdapter):
         )
 
         reply_for_hook = reply
-        notify_done_seen = done_seen
-        if task.cancelled:
-            _write_log(f"[WARN] Task cancelled, sending failure completion hook: req_id={task.req_id}")
-            notify_done_seen = False
-            if not reply_for_hook.strip():
-                reply_for_hook = "Task cancelled or timed out before completion."
-        _write_log(f"[INFO] notify_completion caller={req.caller} done_seen={notify_done_seen}")
+        if not reply_for_hook.strip():
+            reply_for_hook = default_reply_for_status(status, done_seen=done_seen)
+        _write_log(f"[INFO] notify_completion caller={req.caller} status={status} done_seen={done_seen}")
         notify_completion(
             provider="codex",
             output_file=req.output_path,
             reply=reply_for_hook,
             req_id=task.req_id,
-            done_seen=notify_done_seen,
+            done_seen=done_seen,
+            status=status,
             caller=req.caller,
             email_req_id=req.email_req_id,
             email_msg_id=req.email_msg_id,

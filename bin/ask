@@ -221,6 +221,10 @@ def _maybe_start_unified_daemon() -> bool:
     from askd_runtime import state_file_path
     from askd.daemon import ping_daemon
 
+    autostart_raw = (os.environ.get("CCB_ASKD_AUTOSTART") or "").strip().lower()
+    if autostart_raw in ("0", "false", "no", "off"):
+        return False
+
     # Check if already running
     state_file = state_file_path("askd.json")
     if ping_daemon(timeout_s=0.5, state_file=state_file):
@@ -247,11 +251,15 @@ def _maybe_start_unified_daemon() -> bool:
 
     # Start daemon in background with platform-specific flags
     try:
+        child_env = os.environ.copy()
+        child_env.pop("CCB_PARENT_PID", None)
+        child_env.pop("CCB_MANAGED", None)
         kwargs = {
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.DEVNULL,
             "stderr": subprocess.DEVNULL,
             "close_fds": True,
+            "env": child_env,
         }
         if os.name == "nt":
             kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -583,6 +591,15 @@ def main(argv: list[str]) -> int:
                 return EXIT_ERROR
 
     # Default async mode: background task
+    if _use_unified_daemon():
+        from askd_runtime import state_file_path
+        from askd.daemon import ping_daemon
+
+        state_file = state_file_path("askd.json")
+        if not ping_daemon(timeout_s=0.5, state_file=state_file) and not _maybe_start_unified_daemon():
+            print("[ERROR] Unified askd daemon not running", file=sys.stderr)
+            return EXIT_ERROR
+
     task_id = make_task_id()
     log_dir = Path(tempfile.gettempdir()) / "ccb-tasks"
     log_dir.mkdir(parents=True, exist_ok=True)

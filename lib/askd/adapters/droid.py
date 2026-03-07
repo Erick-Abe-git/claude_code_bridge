@@ -13,7 +13,14 @@ from typing import Any, Optional
 from askd.adapters.base import BaseProviderAdapter, ProviderRequest, ProviderResult, QueuedTask
 from askd_runtime import log_path, write_log
 from ccb_protocol import REQ_ID_PREFIX
-from completion_hook import notify_completion
+from completion_hook import (
+    COMPLETION_STATUS_CANCELLED,
+    COMPLETION_STATUS_COMPLETED,
+    COMPLETION_STATUS_FAILED,
+    COMPLETION_STATUS_INCOMPLETE,
+    default_reply_for_status,
+    notify_completion,
+)
 from daskd_protocol import extract_reply_for_req, is_done_text, wrap_droid_prompt
 from daskd_session import compute_session_key, load_project_session
 from droid_comm import DroidLogReader
@@ -77,6 +84,7 @@ class DroidAdapter(BaseProviderAdapter):
                 req_id=task.req_id,
                 session_key=session_key,
                 done_seen=False,
+                status=COMPLETION_STATUS_FAILED,
             )
 
         ok, pane_or_err = session.ensure_pane()
@@ -87,6 +95,7 @@ class DroidAdapter(BaseProviderAdapter):
                 req_id=task.req_id,
                 session_key=session_key,
                 done_seen=False,
+                status=COMPLETION_STATUS_FAILED,
             )
         pane_id = pane_or_err
 
@@ -98,6 +107,7 @@ class DroidAdapter(BaseProviderAdapter):
                 req_id=task.req_id,
                 session_key=session_key,
                 done_seen=False,
+                status=COMPLETION_STATUS_FAILED,
             )
 
         log_reader = DroidLogReader(work_dir=Path(session.work_dir))
@@ -158,6 +168,7 @@ class DroidAdapter(BaseProviderAdapter):
                         anchor_seen=anchor_seen,
                         fallback_scan=fallback_scan,
                         anchor_ms=anchor_ms,
+                        status=COMPLETION_STATUS_FAILED,
                     )
                 last_pane_check = time.time()
 
@@ -194,18 +205,19 @@ class DroidAdapter(BaseProviderAdapter):
 
         combined = "\n".join(chunks)
         final_reply = extract_reply_for_req(combined, task.req_id)
-
-        reply_for_hook = final_reply
+        status = COMPLETION_STATUS_COMPLETED if done_seen else COMPLETION_STATUS_INCOMPLETE
         if task.cancelled:
-            _write_log(f"[WARN] Task cancelled, sending failure completion hook: req_id={task.req_id}")
-            if not reply_for_hook.strip():
-                reply_for_hook = "Task cancelled or timed out before completion."
+            status = COMPLETION_STATUS_CANCELLED
+        reply_for_hook = final_reply
+        if not reply_for_hook.strip():
+            reply_for_hook = default_reply_for_status(status, done_seen=done_seen)
         notify_completion(
             provider="droid",
             output_file=req.output_path,
             reply=reply_for_hook,
             req_id=task.req_id,
-            done_seen=done_seen and (not task.cancelled),
+            done_seen=done_seen,
+            status=status,
             caller=req.caller,
             email_req_id=req.email_req_id,
             email_msg_id=req.email_msg_id,
@@ -223,6 +235,7 @@ class DroidAdapter(BaseProviderAdapter):
             anchor_seen=anchor_seen,
             anchor_ms=anchor_ms,
             fallback_scan=fallback_scan,
+            status=status,
         )
         _write_log(f"[INFO] done provider=droid req_id={task.req_id} exit={result.exit_code}")
         return result

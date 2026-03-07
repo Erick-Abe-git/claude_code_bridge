@@ -44,6 +44,7 @@ class ProviderResult:
     fallback_scan: bool = False
     log_path: Optional[str] = None
     extra: Optional[dict] = None
+    status: str = ""
 
 
 class QueuedTaskLike(Protocol):
@@ -118,6 +119,7 @@ class BaseProviderAdapter(ABC):
             req_id=task.req_id,
             session_key=f"{self.key}:unknown",
             done_seen=False,
+            status="failed",
         )
 
     def on_start(self) -> None:

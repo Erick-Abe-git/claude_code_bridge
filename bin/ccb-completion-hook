@@ -33,6 +33,12 @@ lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
 from compat import read_stdin_text, setup_windows_encoding
+from completion_hook import (
+    completion_status_label,
+    completion_status_marker,
+    default_reply_for_status,
+    normalize_completion_status,
+)
 from session_utils import find_project_session_file
 
 setup_windows_encoding()
@@ -96,11 +102,9 @@ def _path_is_same_or_parent(parent: str, child: str) -> bool:
 def _work_dirs_compatible(session_work_dir: str, request_work_dir: str) -> bool:
     if not session_work_dir or not request_work_dir:
         return True
-    # Accept exact match and parent/child relationship to support calls from subdirectories.
-    return (
-        _path_is_same_or_parent(session_work_dir, request_work_dir)
-        or _path_is_same_or_parent(request_work_dir, session_work_dir)
-    )
+    # Accept exact match and parent->child relationship to support subdirectory calls
+    # without letting nested child projects hijack parent-project notifications.
+    return _path_is_same_or_parent(session_work_dir, request_work_dir)
 
 
 def send_via_terminal(pane_id: str, message: str, terminal: str, session_data: dict) -> bool:
@@ -243,7 +247,37 @@ def find_ask_command() -> str | None:
     return None
 
 
-def send_email_reply(provider: str, reply_content: str) -> bool:
+def _render_terminal_message(
+    provider_display: str,
+    req_id: str,
+    reply_content: str,
+    *,
+    output_file: str | None,
+    status: str,
+) -> str:
+    marker = completion_status_marker(status)
+    status_label = completion_status_label(status)
+    if output_file:
+        return f"""CCB_REQ_ID: {req_id}
+
+{marker}
+Provider: {provider_display}
+Status: {status_label}
+Output file: {output_file}
+
+Result: {reply_content}
+"""
+    return f"""CCB_REQ_ID: {req_id}
+
+{marker}
+Provider: {provider_display}
+Status: {status_label}
+
+Result: {reply_content}
+"""
+
+
+def send_email_reply(provider: str, reply_content: str, *, status: str) -> bool:
     """Send reply via email when CCB_CALLER=email."""
     try:
         from mail import load_config, SmtpSender
@@ -300,8 +334,9 @@ def send_email_reply(provider: str, reply_content: str) -> bool:
         # Remove common reply prefixes (case insensitive)
         subject = re.sub(r'^(Re:\s*|RE:\s*|回复：\s*|回复:\s*)+', '', subject, flags=re.IGNORECASE)
 
+    status_label = completion_status_label(status)
     if not subject:
-        subject = f"[CCB] {provider.capitalize()} response"
+        subject = f"[CCB] {provider.capitalize()} {status_label.lower()}"
 
     # Build references chain for threading
     refs = ""
@@ -313,7 +348,7 @@ def send_email_reply(provider: str, reply_content: str) -> bool:
         refs = msg_id
 
     sender = SmtpSender(config)
-    body = f"[{provider.capitalize()}] {reply_content}"
+    body = f"[{provider.capitalize()} {status_label}] {reply_content}"
 
     success, result = sender.send_reply(
         to_addr=from_addr,
@@ -361,12 +396,19 @@ def main() -> int:
         reply_content = read_stdin_text()
     if not reply_content:
         reply_content = args.reply or ""
+    done_seen = env_bool("CCB_DONE_SEEN", True)
+    status = normalize_completion_status(os.environ.get("CCB_COMPLETION_STATUS", ""), done_seen=done_seen)
+    if not reply_content:
+        reply_content = default_reply_for_status(status, done_seen=done_seen)
 
     # Handle email caller - send reply via email
     if caller == "email":
-        if send_email_reply(provider, reply_content):
+        if send_email_reply(provider, reply_content, status=status):
             return 0
         return 1
+
+    if caller == "manual":
+        return 0
 
     # Terminal caller - construct notification message
     provider_names = {
@@ -378,23 +420,13 @@ def main() -> int:
     provider_display = provider_names.get(provider, provider.capitalize())
     req_id = args.req_id or "unknown"
 
-    if output_file:
-        message = f"""CCB_REQ_ID: {req_id}
-
-[CCB_TASK_COMPLETED]
-Provider: {provider_display}
-Output file: {output_file}
-
-Result: {reply_content}
-"""
-    else:
-        message = f"""CCB_REQ_ID: {req_id}
-
-[CCB_TASK_COMPLETED]
-Provider: {provider_display}
-
-Result: {reply_content}
-"""
+    message = _render_terminal_message(
+        provider_display,
+        req_id,
+        reply_content,
+        output_file=output_file,
+        status=status,
+    )
 
     # Find caller's pane_id from session file
     session_files = {
